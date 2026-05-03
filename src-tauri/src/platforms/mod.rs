@@ -76,6 +76,18 @@ pub trait PlatformAdapter: Send + Sync {
     fn update_message(&self, edit_target: &str, new_content: &str) -> Result<String, String>;
     fn matches_query(&self, session_key: &str, query: &str) -> bool;
     fn content_search(&self, session_key: &str, query: &str) -> Vec<ContentMatch>;
+    fn resolve_execution_output(&self, _session_key: &str, _edit_target: &str) -> Result<String, String> {
+        Err("Execution output loading is not supported for this platform".to_string())
+    }
+    fn resolve_execution_outputs(&self, session_key: &str, edit_targets: &[String]) -> Result<HashMap<String, String>, String> {
+        let mut outputs = HashMap::new();
+        for edit_target in edit_targets {
+            if let Ok(output) = self.resolve_execution_output(session_key, edit_target) {
+                outputs.insert(edit_target.clone(), output);
+            }
+        }
+        Ok(outputs)
+    }
 }
 
 /// Extract a snippet of ~120 chars around the first occurrence of `needle` in `text`.

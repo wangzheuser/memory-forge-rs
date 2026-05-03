@@ -34,8 +34,15 @@ export function SessionDetail() {
   const [inlineSearch, setInlineSearch] = useState('')
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0)
   const [tocOpen, setTocOpen] = useState(false)
+  const [loadingExecutionTargets, setLoadingExecutionTargets] = useState<Set<string>>(new Set())
+  const [loadingAllExecutionOutputs, setLoadingAllExecutionOutputs] = useState(false)
   const blockRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const activeSessionKeyRef = useRef<string | null>(null)
   const { confirm, dialogProps: confirmDialogProps } = useConfirmDialog()
+
+  useEffect(() => {
+    activeSessionKeyRef.current = sessionDetail?.sessionKey ?? null
+  }, [sessionDetail?.sessionKey])
 
   useEffect(() => {
     setAliasTitle(sessionDetail?.aliasTitle || '')
@@ -62,6 +69,14 @@ export function SessionDetail() {
   }, [dispatch, sessionStatus])
 
   const blocks = sessionDetail?.blocks ?? []
+  const kiroExecutionPlaceholderBlocks = useMemo(() => {
+    if (currentPlatform !== 'kiro-ide') return []
+    return blocks.filter(block =>
+      block.role === 'assistant'
+      && block.content.trim() === 'On it.'
+      && block.editTarget?.includes('::execution::')
+    )
+  }, [blocks, currentPlatform])
   const filteredBlocks = roleFilter === 'all'
     ? blocks
     : blocks.filter(b => b.role === roleFilter)
@@ -154,6 +169,67 @@ export function SessionDetail() {
     } catch (err) {
       console.error('Failed to erase message:', err)
       dispatch({ type: 'setSessionStatus', payload: { tone: 'error', message: t('session.saveFailed') } })
+    }
+  }
+
+  const handleLoadExecutionOutput = async (block: typeof sessionDetail.blocks[0]) => {
+    if (!sessionDetail || !block.editTarget) return
+
+    const target = block.editTarget
+    setLoadingExecutionTargets(prev => new Set(prev).add(target))
+    dispatch({ type: 'setSessionStatus', payload: null })
+
+    try {
+      const output = await api.getExecutionOutput(currentPlatform, sessionDetail.sessionKey, target)
+      if (activeSessionKeyRef.current !== sessionDetail.sessionKey) return
+      const updatedBlocks = sessionDetail.blocks.map(b =>
+        (b.editTarget || b.id) === target ? { ...b, content: output } : b
+      )
+      dispatch({ type: 'setSessionDetail', payload: { ...sessionDetail, blocks: updatedBlocks } })
+      dispatch({ type: 'setSessionStatus', payload: { tone: 'success', message: t('session.refreshed') } })
+    } catch (err) {
+      console.error('Failed to load execution output:', err)
+      dispatch({ type: 'setSessionStatus', payload: { tone: 'error', message: t('session.refreshFailed') } })
+    } finally {
+      setLoadingExecutionTargets(prev => {
+        const next = new Set(prev)
+        next.delete(target)
+        return next
+      })
+    }
+  }
+
+  const handleLoadAllExecutionOutputs = async () => {
+    if (!sessionDetail || kiroExecutionPlaceholderBlocks.length === 0) return
+
+    const targets = kiroExecutionPlaceholderBlocks
+      .map(block => block.editTarget)
+      .filter((target): target is string => Boolean(target))
+    if (targets.length === 0) return
+
+    setLoadingAllExecutionOutputs(true)
+    setLoadingExecutionTargets(new Set(targets))
+    dispatch({ type: 'setSessionStatus', payload: null })
+
+    try {
+      const outputs = await api.getExecutionOutputs(currentPlatform, sessionDetail.sessionKey, targets)
+      if (activeSessionKeyRef.current !== sessionDetail.sessionKey) return
+      const updatedBlocks = sessionDetail.blocks.map(block => {
+        const target = block.editTarget || block.id
+        const output = outputs[target]
+        return output ? { ...block, content: output } : block
+      })
+      dispatch({ type: 'setSessionDetail', payload: { ...sessionDetail, blocks: updatedBlocks } })
+      dispatch({
+        type: 'setSessionStatus',
+        payload: { tone: 'success', message: `已加载 ${Object.keys(outputs).length}/${targets.length} 条真实输出` },
+      })
+    } catch (err) {
+      console.error('Failed to load all execution outputs:', err)
+      dispatch({ type: 'setSessionStatus', payload: { tone: 'error', message: '加载真实输出失败' } })
+    } finally {
+      setLoadingAllExecutionOutputs(false)
+      setLoadingExecutionTargets(new Set())
     }
   }
 
@@ -290,6 +366,20 @@ export function SessionDetail() {
               {refreshDone ? <CheckCircle className="w-4 h-4" /> : <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />}
               <span className="hidden sm:inline">{refreshDone ? t('session.refreshed') : t('session.refresh')}</span>
             </Button>
+            {kiroExecutionPlaceholderBlocks.length > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2 hover:bg-blue-500/10 hover:text-blue-400"
+                onClick={handleLoadAllExecutionOutputs}
+                disabled={loadingAllExecutionOutputs}
+              >
+                <RefreshCw className={cn("w-4 h-4", loadingAllExecutionOutputs && "animate-spin")} />
+                <span className="hidden sm:inline">
+                  {loadingAllExecutionOutputs ? '加载中' : `加载全部真实输出 (${kiroExecutionPlaceholderBlocks.length})`}
+                </span>
+              </Button>
+            )}
             {['resume', 'fork'].filter(label => sessionDetail.commands?.[label]).map(label => {
               const command = sessionDetail.commands[label]
               return (
@@ -432,6 +522,8 @@ export function SessionDetail() {
               index={index}
               onEdit={() => handleEditBlock(block)}
               onErase={() => handleEraseBlock(block)}
+              onLoadExecutionOutput={() => handleLoadExecutionOutput(block)}
+              loadingExecutionOutput={Boolean(block.editTarget && loadingExecutionTargets.has(block.editTarget))}
               t={t}
               searchHighlight={searchNeedle}
               isSearchMatch={matchingBlockIds.includes(block.id)}
@@ -496,15 +588,17 @@ export function SessionDetail() {
 }
 
 const MessageBlock = forwardRef<HTMLDivElement, {
-  block: { role: string; content: string; id: string; editable?: boolean }
+  block: { role: string; content: string; id: string; editTarget?: string; editable?: boolean }
   index: number
   onEdit: () => void
   onErase: () => void
+  onLoadExecutionOutput?: () => void
+  loadingExecutionOutput?: boolean
   t: (key: MessageKey, params?: Record<string, string | number>) => string
   searchHighlight?: string
   isSearchMatch?: boolean
   isCurrentMatch?: boolean
-}>(function MessageBlock({ block, index, onEdit, onErase, t, searchHighlight, isCurrentMatch }, ref) {
+}>(function MessageBlock({ block, index, onEdit, onErase, onLoadExecutionOutput, loadingExecutionOutput, t, searchHighlight, isCurrentMatch }, ref) {
   const roleConfig = {
     user: { label: t('session.filter.user'), icon: User, bgGradient: 'from-blue-500/10 to-blue-500/5', borderColor: 'border-l-blue-500', iconBg: 'bg-blue-500/20 text-blue-400', badgeClass: 'bg-blue-500/15 text-blue-400 border-blue-500/30' },
     assistant: { label: t('session.filter.assistant'), icon: Bot, bgGradient: 'from-green-500/10 to-green-500/5', borderColor: 'border-l-green-500', iconBg: 'bg-green-500/20 text-green-400', badgeClass: 'bg-green-500/15 text-green-400 border-green-500/30' },
@@ -512,6 +606,9 @@ const MessageBlock = forwardRef<HTMLDivElement, {
   }
   const config = roleConfig[block.role as keyof typeof roleConfig] || roleConfig.assistant
   const Icon = config.icon
+  const isKiroExecutionPlaceholder = block.role === 'assistant'
+    && block.content.trim() === 'On it.'
+    && block.editTarget?.includes('::execution::')
 
   const renderContent = () => {
     if (!searchHighlight) return block.content
@@ -556,6 +653,18 @@ const MessageBlock = forwardRef<HTMLDivElement, {
             >
               <Pencil className="w-3 h-3" />{t('session.editThisMessage')}
             </Button>
+            {isKiroExecutionPlaceholder && onLoadExecutionOutput && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-3 ml-2 gap-1.5 border-blue-500/30 bg-blue-500/5 text-blue-400 text-xs hover:bg-blue-500/15 hover:text-blue-300"
+                disabled={loadingExecutionOutput}
+                onClick={(e) => { e.stopPropagation(); onLoadExecutionOutput() }}
+              >
+                <RefreshCw className={cn("w-3 h-3", loadingExecutionOutput && "animate-spin")} />
+                {loadingExecutionOutput ? '加载中' : '加载真实输出'}
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"

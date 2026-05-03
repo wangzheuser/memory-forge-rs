@@ -81,6 +81,36 @@ fn session_detail(
 }
 
 #[tauri::command]
+async fn session_execution_output(
+    settings_state: tauri::State<'_, SharedSettingsState>,
+    platform: String,
+    session_key: String,
+    edit_target: String,
+) -> Result<String, String> {
+    let settings = settings_state.settings.lock().map_err(|_| "lock error".to_string())?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        session_service::session_execution_output(&settings, &platform, &session_key, &edit_target)
+    })
+    .await
+    .map_err(|e| format!("Task error: {e}"))?
+}
+
+#[tauri::command]
+async fn session_execution_outputs(
+    settings_state: tauri::State<'_, SharedSettingsState>,
+    platform: String,
+    session_key: String,
+    edit_targets: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let settings = settings_state.settings.lock().map_err(|_| "lock error".to_string())?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        session_service::session_execution_outputs(&settings, &platform, &session_key, &edit_targets)
+    })
+    .await
+    .map_err(|e| format!("Task error: {e}"))?
+}
+
+#[tauri::command]
 fn session_set_alias(
     db: tauri::State<'_, DbState>,
     platform: String,
@@ -248,6 +278,8 @@ fn main() {
             dashboard_summary,
             session_list,
             session_detail,
+            session_execution_output,
+            session_execution_outputs,
             session_set_alias,
             session_toggle_flag,
             session_batch_set_flag,

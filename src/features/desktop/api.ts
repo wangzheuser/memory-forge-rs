@@ -289,6 +289,20 @@ export const api = {
     return data.detail ?? data;
   },
 
+  async getExecutionOutput(platform: string, sessionKey: string, editTarget: string): Promise<string> {
+    if (isTauriRuntime()) {
+      return invoke<string>("session_execution_output", { platform, sessionKey, editTarget });
+    }
+    throw new Error("Execution output loading is not supported in web preview");
+  },
+
+  async getExecutionOutputs(platform: string, sessionKey: string, editTargets: string[]): Promise<Record<string, string>> {
+    if (isTauriRuntime()) {
+      return invoke<Record<string, string>>("session_execution_outputs", { platform, sessionKey, editTargets });
+    }
+    throw new Error("Execution output loading is not supported in web preview");
+  },
+
   async setAlias(platform: string, sessionKey: string, title: string) {
     if (isTauriRuntime()) {
       return invoke("session_set_alias", { platform, sessionKey, title });

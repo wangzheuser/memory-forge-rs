@@ -5,8 +5,15 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{build_commands, extract_snippet, ContentMatch, PlatformAdapter, SessionDetail, SessionListItem, SessionListResult, TimelineBlock};
+
+const EXECUTION_LOG_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const EXECUTION_LOG_DEEP_SCAN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const EXECUTION_LOG_SCAN_MAX_MILLIS: u128 = 1_500;
+const EXECUTION_LOG_DEEP_SCAN_MAX_MILLIS: u128 = 20_000;
+const EXECUTION_LOG_SCAN_FALLBACK_MAX_FILES: usize = 256;
 
 pub struct KiroIdePlatform {
     agent_home: PathBuf,
@@ -70,31 +77,100 @@ impl KiroIdePlatform {
             .map_err(|e| format!("Failed to parse Kiro IDE session '{}': {e}", path.display()))
     }
 
-    fn execution_log_files(&self) -> Vec<PathBuf> {
+    fn execution_log_files(&self, workspace_dir: Option<&str>) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        collect_possible_log_files(&self.agent_home, &mut files, 0);
+
+        if let Some(root) = workspace_dir.and_then(|cwd| self.workspace_execution_root(cwd)) {
+            collect_workspace_log_files(&root, &mut files);
+            if !files.is_empty() {
+                return files;
+            }
+        }
+
+        collect_possible_log_files(
+            &self.agent_home,
+            &mut files,
+            0,
+            EXECUTION_LOG_SCAN_FALLBACK_MAX_FILES,
+        );
         files
     }
 
-    fn execution_outputs(&self, session_id: &str, execution_ids: &HashSet<String>) -> HashMap<String, String> {
+    fn workspace_execution_root(&self, workspace_dir: &str) -> Option<PathBuf> {
+        let normalized = workspace_dir.replace('/', "\\").to_ascii_lowercase();
+        if normalized.trim().is_empty() {
+            return None;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        let root = self.agent_home.join(&digest[..32]);
+        if root.is_dir() { Some(root) } else { None }
+    }
+
+    fn with_deep_fallback_log_files(&self, mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut seen: HashSet<PathBuf> = files.iter().cloned().collect();
+        let mut fallback = Vec::new();
+        collect_possible_log_files(&self.agent_home, &mut fallback, 0, usize::MAX);
+        for path in fallback {
+            if seen.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    fn execution_outputs(&self, workspace_dir: Option<&str>, session_id: &str, execution_ids: &HashSet<String>) -> HashMap<String, String> {
+        self.execution_outputs_with_budget(workspace_dir, session_id, execution_ids, EXECUTION_LOG_SCAN_MAX_MILLIS)
+    }
+
+    fn execution_outputs_with_budget(&self, workspace_dir: Option<&str>, session_id: &str, execution_ids: &HashSet<String>, max_millis: u128) -> HashMap<String, String> {
         if execution_ids.is_empty() {
             return HashMap::new();
         }
 
         let t0 = Instant::now();
-        let mut outputs = HashMap::new();
-        let files = self.execution_log_files();
+        let mut raw_outputs = HashMap::new();
+        let mut alias_outputs: HashMap<String, String> = HashMap::new();
+        let mut target_ids = execution_ids.clone();
+        let files = self.execution_log_files(workspace_dir);
         let file_count = files.len();
+        let scan_count = file_count;
+        let max_bytes = if max_millis > EXECUTION_LOG_SCAN_MAX_MILLIS {
+            EXECUTION_LOG_DEEP_SCAN_MAX_BYTES
+        } else {
+            EXECUTION_LOG_SCAN_MAX_BYTES
+        };
 
-        for path in files {
-            if outputs.len() == execution_ids.len() {
+        eprintln!(
+            "[perf] kiro-ide execution_outputs start session={session_id} files={file_count} scanning={scan_count} requested={}",
+            execution_ids.len()
+        );
+
+        let mut scanned = 0usize;
+        let mut timed_out = false;
+        for path in &files {
+            if t0.elapsed().as_millis() > max_millis {
+                timed_out = true;
                 break;
+            }
+            if final_output_count(execution_ids, &raw_outputs, &alias_outputs) == execution_ids.len() {
+                break;
+            }
+
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            if meta.len() > max_bytes {
+                continue;
             }
 
             let Ok(raw) = fs::read_to_string(&path) else {
                 continue;
             };
-            if !raw.contains(session_id) {
+            scanned += 1;
+            if !raw.contains(session_id) && !contains_any_execution_id(&raw, &target_ids) {
                 continue;
             }
 
@@ -105,31 +181,100 @@ impl KiroIdePlatform {
                 continue;
             }
 
-            let Some(actions) = parsed.get("actions").and_then(Value::as_array) else {
-                continue;
-            };
-            for action in actions.iter().rev() {
-                let Some(execution_id) = action.get("executionId").and_then(Value::as_str) else {
+            collect_execution_aliases(&parsed, execution_ids, &mut alias_outputs, &mut target_ids);
+
+            for (execution_id, output) in extract_execution_outputs_from_log(&parsed, &target_ids) {
+                insert_longer_owned_output(&mut raw_outputs, execution_id, output);
+            }
+        }
+
+        if final_output_count(execution_ids, &raw_outputs, &alias_outputs) < execution_ids.len()
+            && !alias_outputs.is_empty()
+        {
+            for path in &files {
+                if t0.elapsed().as_millis() > max_millis {
+                    timed_out = true;
+                    break;
+                }
+                if final_output_count(execution_ids, &raw_outputs, &alias_outputs) == execution_ids.len() {
+                    break;
+                }
+
+                let Ok(meta) = path.metadata() else {
                     continue;
                 };
-                if !execution_ids.contains(execution_id) || outputs.contains_key(execution_id) {
+                if meta.len() > max_bytes {
                     continue;
                 }
-                if action.get("actionType").and_then(Value::as_str) != Some("say") {
-                    continue;
-                }
-                let Some(message) = action.get("output").and_then(|output| output.get("message")).and_then(Value::as_str) else {
+
+                let Ok(raw) = fs::read_to_string(path) else {
                     continue;
                 };
-                let message = message.trim();
-                if !message.is_empty() {
-                    outputs.insert(execution_id.to_string(), message.to_string());
+                scanned += 1;
+                if !raw.contains(session_id) && !contains_any_execution_id(&raw, &target_ids) {
+                    continue;
+                }
+
+                let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                if parsed.get("chatSessionId").and_then(Value::as_str) != Some(session_id) {
+                    continue;
+                }
+
+                for (execution_id, output) in extract_execution_outputs_from_log(&parsed, &target_ids) {
+                    insert_longer_owned_output(&mut raw_outputs, execution_id, output);
                 }
             }
         }
 
+        if final_output_count(execution_ids, &raw_outputs, &alias_outputs) < execution_ids.len()
+            && max_millis > EXECUTION_LOG_SCAN_MAX_MILLIS
+        {
+            let mut fallback_files = self.with_deep_fallback_log_files(files.clone());
+            fallback_files.retain(|path| !files.contains(path));
+            for path in &fallback_files {
+                if t0.elapsed().as_millis() > max_millis {
+                    timed_out = true;
+                    break;
+                }
+                if final_output_count(execution_ids, &raw_outputs, &alias_outputs) == execution_ids.len() {
+                    break;
+                }
+
+                let Ok(meta) = path.metadata() else {
+                    continue;
+                };
+                if meta.len() > max_bytes {
+                    continue;
+                }
+
+                let Ok(raw) = fs::read_to_string(path) else {
+                    continue;
+                };
+                scanned += 1;
+                if !raw.contains(session_id) && !contains_any_execution_id(&raw, &target_ids) {
+                    continue;
+                }
+
+                let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                if parsed.get("chatSessionId").and_then(Value::as_str) != Some(session_id) {
+                    continue;
+                }
+
+                collect_execution_aliases(&parsed, execution_ids, &mut alias_outputs, &mut target_ids);
+                for (execution_id, output) in extract_execution_outputs_from_log(&parsed, &target_ids) {
+                    insert_longer_owned_output(&mut raw_outputs, execution_id, output);
+                }
+            }
+        }
+
+        let outputs = finalize_execution_outputs(execution_ids, raw_outputs, alias_outputs);
+
         eprintln!(
-            "[perf] kiro-ide execution_outputs session={session_id} files={file_count} requested={} found={}: {:?}",
+            "[perf] kiro-ide execution_outputs session={session_id} files={file_count} scanned={scanned}/{scan_count} requested={} found={} timed_out={timed_out}: {:?}",
             execution_ids.len(),
             outputs.len(),
             t0.elapsed()
@@ -137,14 +282,99 @@ impl KiroIdePlatform {
         outputs
     }
 
-    fn update_execution_output(&self, session_id: &str, execution_id: &str, new_content: &str) -> Result<String, String> {
+    fn resolve_execution_output_inner(&self, session_key: &str, edit_target: &str) -> Result<String, String> {
+        let (target_session_key, _message_id, execution_id) = parse_execution_edit_target(edit_target)
+            .ok_or_else(|| format!("Invalid Kiro IDE execution target: {edit_target}"))?;
+        if target_session_key != session_key {
+            return Err("Execution target does not belong to this session".to_string());
+        }
+
+        let (workspace_key, session_id) = Self::parse_session_key(session_key)
+            .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
+        let workspace_dir = self
+            .read_index(workspace_key)
+            .into_iter()
+            .find(|entry| entry.session_id == session_id)
+            .map(|entry| entry.workspace_directory);
+
+        let mut ids = HashSet::new();
+        ids.insert(execution_id.to_string());
+        let outputs = self.execution_outputs_with_budget(
+            workspace_dir.as_deref(),
+            session_id,
+            &ids,
+            EXECUTION_LOG_DEEP_SCAN_MAX_MILLIS,
+        );
+
+        outputs
+            .get(execution_id)
+            .cloned()
+            .ok_or_else(|| format!("Execution output not found: {execution_id}"))
+    }
+
+    fn resolve_execution_outputs_inner(&self, session_key: &str, edit_targets: &[String]) -> Result<HashMap<String, String>, String> {
+        let (workspace_key, session_id) = Self::parse_session_key(session_key)
+            .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
+        let workspace_dir = self
+            .read_index(workspace_key)
+            .into_iter()
+            .find(|entry| entry.session_id == session_id)
+            .map(|entry| entry.workspace_directory);
+
+        let mut execution_to_targets: HashMap<String, Vec<String>> = HashMap::new();
+        for edit_target in edit_targets {
+            let Some((target_session_key, _message_id, execution_id)) = parse_execution_edit_target(edit_target) else {
+                continue;
+            };
+            if target_session_key != session_key {
+                continue;
+            }
+            execution_to_targets
+                .entry(execution_id.to_string())
+                .or_default()
+                .push(edit_target.clone());
+        }
+
+        let execution_ids: HashSet<String> = execution_to_targets.keys().cloned().collect();
+        let execution_outputs = self.execution_outputs_with_budget(
+            workspace_dir.as_deref(),
+            session_id,
+            &execution_ids,
+            EXECUTION_LOG_DEEP_SCAN_MAX_MILLIS,
+        );
+
+        let mut outputs = HashMap::new();
+        for (execution_id, output) in execution_outputs {
+            if let Some(targets) = execution_to_targets.get(&execution_id) {
+                for target in targets {
+                    outputs.insert(target.clone(), output.clone());
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    fn update_execution_output(&self, workspace_dir: Option<&str>, session_id: &str, execution_id: &str, new_content: &str) -> Result<String, String> {
         let t0 = Instant::now();
-        let files = self.execution_log_files();
+        let files = self.execution_log_files(workspace_dir);
+        let file_count = files.len();
         let mut old_content = None;
         let mut updated_files = 0usize;
         let mut context_replacements = 0usize;
 
+        let mut timed_out = false;
         for path in &files {
+            if t0.elapsed().as_millis() > EXECUTION_LOG_SCAN_MAX_MILLIS {
+                timed_out = true;
+                break;
+            }
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            if meta.len() > EXECUTION_LOG_SCAN_MAX_BYTES {
+                continue;
+            }
+
             let raw = match fs::read_to_string(path) {
                 Ok(raw) => raw,
                 Err(_) => continue,
@@ -170,9 +400,26 @@ impl KiroIdePlatform {
             break;
         }
 
-        let old_content = old_content.ok_or_else(|| format!("Execution log not found: {execution_id}"))?;
+        let old_content = old_content.ok_or_else(|| {
+            if timed_out {
+                format!("Execution log scan timed out before finding: {execution_id}")
+            } else {
+                format!("Execution log not found: {execution_id}")
+            }
+        })?;
 
         for path in &files {
+            if t0.elapsed().as_millis() > EXECUTION_LOG_SCAN_MAX_MILLIS {
+                timed_out = true;
+                break;
+            }
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            if meta.len() > EXECUTION_LOG_SCAN_MAX_BYTES {
+                continue;
+            }
+
             let raw = match fs::read_to_string(path) {
                 Ok(raw) => raw,
                 Err(_) => continue,
@@ -200,7 +447,7 @@ impl KiroIdePlatform {
         }
 
         eprintln!(
-            "[perf] kiro-ide update_execution_output session={session_id} execution={execution_id} files={} updated_files={updated_files} context_replacements={context_replacements}: {:?}",
+            "[perf] kiro-ide update_execution_output session={session_id} execution={execution_id} files={file_count} scanned<={} updated_files={updated_files} context_replacements={context_replacements} timed_out={timed_out}: {:?}",
             files.len(),
             t0.elapsed()
         );
@@ -330,7 +577,7 @@ impl PlatformAdapter for KiroIdePlatform {
                     .collect()
             })
             .unwrap_or_default();
-        let execution_outputs = self.execution_outputs(session_id, &execution_ids);
+        let execution_outputs = self.execution_outputs(Some(&cwd), session_id, &execution_ids);
 
         let blocks: Vec<TimelineBlock> = history
             .map(|history| {
@@ -401,9 +648,14 @@ impl PlatformAdapter for KiroIdePlatform {
 
     fn update_message(&self, edit_target: &str, new_content: &str) -> Result<String, String> {
         if let Some((session_key, _message_id, execution_id)) = parse_execution_edit_target(edit_target) {
-            let (_workspace_key, session_id) = Self::parse_session_key(session_key)
+            let (workspace_key, session_id) = Self::parse_session_key(session_key)
                 .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
-            return self.update_execution_output(session_id, execution_id, new_content);
+            let workspace_dir = self
+                .read_index(workspace_key)
+                .into_iter()
+                .find(|entry| entry.session_id == session_id)
+                .map(|entry| entry.workspace_directory);
+            return self.update_execution_output(workspace_dir.as_deref(), session_id, execution_id, new_content);
         }
 
         let mut parts = edit_target.rsplitn(2, "::");
@@ -479,6 +731,14 @@ impl PlatformAdapter for KiroIdePlatform {
         }
         matches
     }
+
+    fn resolve_execution_output(&self, session_key: &str, edit_target: &str) -> Result<String, String> {
+        self.resolve_execution_output_inner(session_key, edit_target)
+    }
+
+    fn resolve_execution_outputs(&self, session_key: &str, edit_targets: &[String]) -> Result<HashMap<String, String>, String> {
+        self.resolve_execution_outputs_inner(session_key, edit_targets)
+    }
 }
 
 fn extract_message_text(content: &Value) -> String {
@@ -546,6 +806,295 @@ fn replace_execution_say_output(execution_log: &mut Value, execution_id: &str, n
     Err(format!("Execution output not found: {execution_id}"))
 }
 
+fn extract_execution_outputs_from_log(execution_log: &Value, execution_ids: &HashSet<String>) -> HashMap<String, String> {
+    let mut outputs = HashMap::new();
+    collect_action_say_outputs(execution_log, execution_ids, &mut outputs);
+    collect_action_error_outputs(execution_log, execution_ids, &mut outputs);
+    collect_execution_log_reference_outputs(execution_log, execution_ids, &mut outputs);
+    collect_current_context_output(execution_log, execution_ids, &mut outputs);
+    outputs
+}
+
+fn contains_any_execution_id(raw: &str, execution_ids: &HashSet<String>) -> bool {
+    execution_ids.iter().any(|execution_id| raw.contains(execution_id))
+}
+
+fn collect_execution_aliases(
+    execution_log: &Value,
+    requested_ids: &HashSet<String>,
+    alias_outputs: &mut HashMap<String, String>,
+    target_ids: &mut HashSet<String>,
+) {
+    let Some(actions) = execution_log.get("actions").and_then(Value::as_array) else {
+        return;
+    };
+
+    for action in actions {
+        let Some(parent_id) = action.get("executionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if !requested_ids.contains(parent_id) {
+            continue;
+        }
+        let Some(child_id) = action
+            .get("output")
+            .and_then(|output| output.get("executionId"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if child_id.is_empty() {
+            continue;
+        }
+        alias_outputs.insert(parent_id.to_string(), child_id.to_string());
+        target_ids.insert(child_id.to_string());
+    }
+}
+
+fn final_output_count(
+    requested_ids: &HashSet<String>,
+    raw_outputs: &HashMap<String, String>,
+    alias_outputs: &HashMap<String, String>,
+) -> usize {
+    requested_ids
+        .iter()
+        .filter(|execution_id| {
+            raw_outputs.contains_key(*execution_id)
+                || alias_outputs
+                    .get(*execution_id)
+                    .is_some_and(|child_id| raw_outputs.contains_key(child_id))
+        })
+        .count()
+}
+
+fn finalize_execution_outputs(
+    requested_ids: &HashSet<String>,
+    raw_outputs: HashMap<String, String>,
+    alias_outputs: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut outputs = HashMap::new();
+    for execution_id in requested_ids {
+        if let Some(output) = raw_outputs.get(execution_id) {
+            outputs.insert(execution_id.clone(), output.clone());
+            continue;
+        }
+        if let Some(child_id) = alias_outputs.get(execution_id) {
+            if let Some(output) = raw_outputs.get(child_id) {
+                outputs.insert(execution_id.clone(), output.clone());
+            }
+        }
+    }
+    outputs
+}
+
+fn collect_action_say_outputs(execution_log: &Value, execution_ids: &HashSet<String>, outputs: &mut HashMap<String, String>) {
+    let Some(actions) = execution_log.get("actions").and_then(Value::as_array) else {
+        return;
+    };
+
+    for action in actions.iter().rev() {
+        let Some(execution_id) = action.get("executionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if !execution_ids.contains(execution_id) {
+            continue;
+        }
+        if action.get("actionType").and_then(Value::as_str) != Some("say") {
+            continue;
+        }
+        let Some(message) = action.get("output").and_then(|output| output.get("message")).and_then(Value::as_str) else {
+            continue;
+        };
+        insert_longer_output(outputs, execution_id, message);
+    }
+}
+
+fn collect_action_error_outputs(execution_log: &Value, execution_ids: &HashSet<String>, outputs: &mut HashMap<String, String>) {
+    let Some(actions) = execution_log.get("actions").and_then(Value::as_array) else {
+        return;
+    };
+
+    for action in actions.iter().rev() {
+        let Some(execution_id) = action.get("executionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if !execution_ids.contains(execution_id) {
+            continue;
+        }
+        if action.get("actionType").and_then(Value::as_str) != Some("displayError") {
+            continue;
+        }
+        let message = action
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or("An unexpected error occurred, please retry.");
+        insert_longer_output(outputs, execution_id, message);
+    }
+}
+
+fn collect_execution_log_reference_outputs(execution_log: &Value, execution_ids: &HashSet<String>, outputs: &mut HashMap<String, String>) {
+    let execution_order: Vec<String> = execution_log
+        .pointer("/input/data/messages")
+        .and_then(Value::as_array)
+        .map(|messages| collect_execution_log_ids_from_messages(messages))
+        .unwrap_or_default();
+    if execution_order.is_empty() {
+        return;
+    }
+
+    let Some(messages) = execution_log
+        .pointer("/input/data/messagesFromExecutionId")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    let mut current_index = 0usize;
+    let mut current_texts: Vec<String> = Vec::new();
+
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "human" {
+            if !current_texts.is_empty() {
+                insert_execution_chunk(outputs, execution_ids, &execution_order, current_index, &current_texts);
+                current_index += 1;
+                current_texts.clear();
+            }
+            continue;
+        }
+
+        if role != "bot" {
+            continue;
+        }
+
+        let text = extract_bot_entry_text(message);
+        if !text.trim().is_empty() && !is_kiro_boilerplate_text(&text) {
+            current_texts.push(text);
+        }
+    }
+
+    if !current_texts.is_empty() {
+        insert_execution_chunk(outputs, execution_ids, &execution_order, current_index, &current_texts);
+    }
+}
+
+fn collect_current_context_output(execution_log: &Value, execution_ids: &HashSet<String>, outputs: &mut HashMap<String, String>) {
+    let Some(execution_id) = execution_log.get("executionId").and_then(Value::as_str) else {
+        return;
+    };
+    if !execution_ids.contains(execution_id) {
+        return;
+    }
+    let Some(messages) = execution_log.pointer("/context/messages").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut current_texts = Vec::new();
+    for message in messages.iter().rev() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "human" {
+            break;
+        }
+        if role != "bot" {
+            continue;
+        }
+
+        let text = extract_bot_entry_text(message);
+        if !text.trim().is_empty() && !is_kiro_boilerplate_text(&text) {
+            current_texts.push(text);
+        }
+    }
+
+    current_texts.reverse();
+    if !current_texts.is_empty() {
+        insert_longer_output(outputs, execution_id, &current_texts.join("\n\n"));
+    }
+}
+
+fn collect_execution_log_ids_from_messages(messages: &[Value]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in content {
+            if item.get("type").and_then(Value::as_str) != Some("executionLog") {
+                continue;
+            }
+            if let Some(execution_id) = item.get("text").and_then(Value::as_str) {
+                ids.push(execution_id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn insert_execution_chunk(
+    outputs: &mut HashMap<String, String>,
+    execution_ids: &HashSet<String>,
+    execution_order: &[String],
+    current_index: usize,
+    texts: &[String],
+) {
+    let Some(execution_id) = execution_order.get(current_index) else {
+        return;
+    };
+    if !execution_ids.contains(execution_id) {
+        return;
+    }
+    insert_longer_output(outputs, execution_id, &texts.join("\n\n"));
+}
+
+fn extract_bot_entry_text(message: &Value) -> String {
+    message
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|entry| entry.get("text").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn insert_longer_output(outputs: &mut HashMap<String, String>, execution_id: &str, output: &str) {
+    let output = output.trim();
+    if output.is_empty() {
+        return;
+    }
+    outputs
+        .entry(execution_id.to_string())
+        .and_modify(|existing| {
+            if output.chars().count() > existing.chars().count() {
+                *existing = output.to_string();
+            }
+        })
+        .or_insert_with(|| output.to_string());
+}
+
+fn insert_longer_owned_output(outputs: &mut HashMap<String, String>, execution_id: String, output: String) {
+    outputs
+        .entry(execution_id)
+        .and_modify(|existing| {
+            if output.chars().count() > existing.chars().count() {
+                *existing = output.clone();
+            }
+        })
+        .or_insert(output);
+}
+
+fn is_kiro_boilerplate_text(text: &str) -> bool {
+    matches!(text.trim(), "Understood." | "I will follow these instructions.")
+}
+
 fn parse_execution_edit_target(edit_target: &str) -> Option<(&str, &str, &str)> {
     let marker = "::execution::";
     let (prefix, execution_id) = edit_target.rsplit_once(marker)?;
@@ -605,8 +1154,39 @@ fn replace_bot_texts_at_path(value: &mut Value, path: &[&str], old_content: &str
     count
 }
 
-fn collect_possible_log_files(root: &PathBuf, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 4 {
+fn collect_workspace_log_files(root: &PathBuf, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if !file_name.starts_with('.') {
+                dirs.push(path);
+            }
+        } else if is_possible_log_file(&path) {
+            out.push(path);
+        }
+    }
+
+    dirs.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+
+    for dir in dirs {
+        collect_possible_log_files(&dir, out, 0, usize::MAX);
+    }
+}
+
+fn collect_possible_log_files(root: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, limit: usize) {
+    if depth > 4 || out.len() >= limit {
         return;
     }
     let Ok(entries) = fs::read_dir(root) else {
@@ -614,21 +1194,28 @@ fn collect_possible_log_files(root: &PathBuf, out: &mut Vec<PathBuf>, depth: usi
     };
 
     for entry in entries.flatten() {
+        if out.len() >= limit {
+            return;
+        }
         let path = entry.path();
         if path.is_dir() {
             let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
             if file_name == "workspace-sessions" || file_name.starts_with('.') {
                 continue;
             }
-            collect_possible_log_files(&path, out, depth + 1);
+            collect_possible_log_files(&path, out, depth + 1, limit);
             continue;
         }
 
-        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        if extension.is_empty() || extension == "json" {
+        if is_possible_log_file(&path) {
             out.push(path);
         }
     }
+}
+
+fn is_possible_log_file(path: &PathBuf) -> bool {
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    extension.is_empty() || extension == "json"
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -742,5 +1329,92 @@ mod tests {
         assert_eq!(execution_log["input"]["data"]["messagesFromExecutionId"][0]["entries"][0]["text"].as_str(), Some("新回复"));
         assert_eq!(execution_log["context"]["messages"][1]["entries"][0]["text"].as_str(), Some("旧回复"));
         assert_eq!(execution_log["context"]["messages"][2]["entries"][0]["message"].as_str(), Some("旧回复"));
+    }
+
+    #[test]
+    fn extracts_outputs_from_kiro_execution_log_references() {
+        let execution_log = json!({
+            "input": {
+                "data": {
+                    "messages": [
+                        { "role": "user", "content": [{ "type": "text", "text": "first" }] },
+                        { "role": "assistant", "content": [{ "type": "executionLog", "text": "exec-1" }] },
+                        { "role": "user", "content": [{ "type": "text", "text": "continue" }] },
+                        { "role": "assistant", "content": [{ "type": "executionLog", "text": "exec-2" }] },
+                        { "role": "user", "content": [{ "type": "text", "text": "continue" }] }
+                    ],
+                    "messagesFromExecutionId": [
+                        { "role": "human", "entries": [{ "type": "text", "text": "first" }] },
+                        { "role": "bot", "entries": [{ "type": "text", "text": "Understood." }] },
+                        { "role": "human", "entries": [{ "type": "text", "text": "first" }] },
+                        { "role": "bot", "entries": [{ "type": "text", "text": "first answer" }] },
+                        { "role": "bot", "entries": [{ "type": "text", "text": "first final" }] },
+                        { "role": "human", "entries": [{ "type": "text", "text": "continue" }] },
+                        { "role": "bot", "entries": [{ "type": "text", "text": "Understood." }] },
+                        { "role": "human", "entries": [{ "type": "text", "text": "continue" }] },
+                        { "role": "bot", "entries": [{ "type": "text", "text": "second answer" }] }
+                    ]
+                }
+            }
+        });
+        let execution_ids = HashSet::from(["exec-1".to_string(), "exec-2".to_string()]);
+        let outputs = extract_execution_outputs_from_log(&execution_log, &execution_ids);
+
+        assert_eq!(outputs.get("exec-1").map(String::as_str), Some("first answer\n\nfirst final"));
+        assert_eq!(outputs.get("exec-2").map(String::as_str), Some("second answer"));
+    }
+
+    #[test]
+    fn maps_spec_agent_child_execution_output_to_parent_execution() {
+        let mut requested_ids = HashSet::new();
+        requested_ids.insert("parent-exec".to_string());
+        let mut target_ids = requested_ids.clone();
+        let mut aliases = HashMap::new();
+
+        let parent_log = json!({
+            "actions": [
+                {
+                    "executionId": "parent-exec",
+                    "actionType": "specAgent",
+                    "output": { "executionId": "child-exec" }
+                }
+            ]
+        });
+        collect_execution_aliases(&parent_log, &requested_ids, &mut aliases, &mut target_ids);
+
+        let child_log = json!({
+            "executionId": "child-exec",
+            "actions": [
+                {
+                    "executionId": "child-exec",
+                    "actionType": "say",
+                    "output": { "message": "child output" }
+                }
+            ]
+        });
+        let raw_outputs = extract_execution_outputs_from_log(&child_log, &target_ids);
+        let outputs = finalize_execution_outputs(&requested_ids, raw_outputs, aliases);
+
+        assert_eq!(outputs.get("parent-exec").map(String::as_str), Some("child output"));
+    }
+
+    #[test]
+    fn extracts_display_error_as_execution_output() {
+        let execution_log = json!({
+            "actions": [
+                {
+                    "executionId": "exec-1",
+                    "actionType": "displayError",
+                    "errorMessage": "An unexpected error occurred, please retry."
+                }
+            ]
+        });
+        let execution_ids = HashSet::from(["exec-1".to_string()]);
+        let outputs = extract_execution_outputs_from_log(&execution_log, &execution_ids);
+
+        assert_eq!(
+            outputs.get("exec-1").map(String::as_str),
+            Some("An unexpected error occurred, please retry.")
+        );
     }
 }

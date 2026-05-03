@@ -221,6 +221,41 @@ pub fn session_detail(db: &DbState, settings: &AppSettings, platform: &str, sess
     Ok(detail)
 }
 
+pub fn session_execution_output(
+    settings: &AppSettings,
+    platform: &str,
+    session_key: &str,
+    edit_target: &str,
+) -> Result<String, String> {
+    let t0 = Instant::now();
+    let adapter = platforms::get_adapter(platform, settings)?;
+    let output = adapter.resolve_execution_output(session_key, edit_target)?;
+    eprintln!(
+        "[perf] session_execution_output({platform}) chars={}: {:?}",
+        output.chars().count(),
+        t0.elapsed()
+    );
+    Ok(output)
+}
+
+pub fn session_execution_outputs(
+    settings: &AppSettings,
+    platform: &str,
+    session_key: &str,
+    edit_targets: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let t0 = Instant::now();
+    let adapter = platforms::get_adapter(platform, settings)?;
+    let outputs = adapter.resolve_execution_outputs(session_key, edit_targets)?;
+    eprintln!(
+        "[perf] session_execution_outputs({platform}) requested={} found={}: {:?}",
+        edit_targets.len(),
+        outputs.len(),
+        t0.elapsed()
+    );
+    Ok(outputs)
+}
+
 pub fn session_set_alias(
     db: &DbState,
     platform: &str,
